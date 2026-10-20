@@ -2,7 +2,7 @@ name: Torch
 
 on:
   push:
-    branches: ['main']
+    branches: ['ios-test']
 
 permissions:
   contents: read
