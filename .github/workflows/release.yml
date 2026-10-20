@@ -67,6 +67,9 @@ jobs:
           - backend: metal
             os: macos-latest-xl
             target: aarch64-apple-darwin
+          - backend: cpu
+            os: macos-latest-xl
+            target: aarch64-apple-ios
 
     runs-on: ${{ matrix.os }}
     env:
@@ -77,6 +80,7 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: '0'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
       TARGET_TRIPLE: ${{ matrix.target }}
+      IOS_DEPLOYMENT_TARGET: '18.0'
 
     steps:
       - name: Enable Git long paths
@@ -327,6 +331,27 @@ jobs:
             )
           fi
 
+          # iOS has no MKL, OpenMP, or MPS. LibTorch links statically into the shim, which
+          # ships as one framework; the full JIT and autograd keep the shim's API complete.
+          if [[ "$TARGET_TRIPLE" == *-apple-ios ]]; then
+            backend_args+=(
+              -DBLAS=Eigen
+              -DUSE_FBGEMM=OFF
+              -DUSE_MKLDNN=OFF
+              -DUSE_OPENMP=OFF
+              -DUSE_PYTORCH_QNNPACK=OFF
+              -DUSE_XNNPACK=ON
+              -DBUILD_LITE_INTERPRETER=OFF
+              -DBUILD_MOBILE_AUTOGRAD=ON
+              -DBUILD_SHARED_LIBS=OFF
+            )
+            platform_args+=(
+              -DCMAKE_SYSTEM_NAME=iOS
+              -DCMAKE_OSX_ARCHITECTURES=arm64
+              "-DCMAKE_OSX_DEPLOYMENT_TARGET=$IOS_DEPLOYMENT_TARGET"
+            )
+          fi
+
           if [[ "$RUNNER_OS" == Windows && "$BACKEND" == cpu ]]; then
             platform_args+=(
               "-DCMAKE_INCLUDE_PATH=$INTEL_OPENMP_ROOT/opt/compiler/include"
@@ -422,6 +447,15 @@ jobs:
             fi
           fi
 
+          if [[ "$TARGET_TRIPLE" == *-apple-ios ]]; then
+            compiler_args+=(
+              -DCMAKE_SYSTEM_NAME=iOS
+              -DCMAKE_OSX_ARCHITECTURES=arm64
+              "-DCMAKE_OSX_DEPLOYMENT_TARGET=$IOS_DEPLOYMENT_TARGET"
+              "-DTorch_DIR=$PWD/install/share/cmake/Torch"
+            )
+          fi
+
           cmake -S shim -B shim-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$PWD/shim-install" \
@@ -432,6 +466,7 @@ jobs:
           cmake --build shim-build --target install --config Release
 
       - name: Package Torch
+        if: matrix.target != 'aarch64-apple-ios'
         shell: bash
         run: |
           mkdir package
@@ -463,6 +498,44 @@ jobs:
             cp "install/lib/${prefix}caffe2_nvrtc.$extension" package/
           fi
           cp "shim-install/${prefix}koharu-torch.$extension" package/
+          tar -C package -czf "$TARGET_TRIPLE-$BACKEND.tar.gz" .
+
+      # iOS loads code only from frameworks signed into the app bundle, so Koharu embeds
+      # this XCFramework and opens Frameworks/koharu-torch.framework/koharu-torch.
+      - name: Package Torch framework
+        if: matrix.target == 'aarch64-apple-ios'
+        shell: bash
+        run: |
+          mkdir package
+          name=koharu-torch
+          framework="frameworks/$name.framework"
+          mkdir -p "$framework"
+          cp "shim-install/lib$name.dylib" "$framework/$name"
+          install_name_tool -id "@rpath/$name.framework/$name" "$framework/$name"
+          cat > "$framework/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key><string>$name</string>
+            <key>CFBundleIdentifier</key><string>rs.koharu.$name</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>$name</string>
+            <key>CFBundlePackageType</key><string>FMWK</string>
+            <key>CFBundleShortVersionString</key><string>1.0</string>
+            <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
+            <key>CFBundleVersion</key><string>1</string>
+            <key>MinimumOSVersion</key><string>$IOS_DEPLOYMENT_TARGET</string>
+          </dict>
+          </plist>
+          PLIST
+          # The shim must not load other Torch libraries at runtime.
+          otool -L "$framework/$name"
+          if otool -L "$framework/$name" | grep -E 'libtorch|libc10'; then
+            echo "koharu-torch links Torch dynamically" >&2
+            exit 1
+          fi
+          xcodebuild -create-xcframework -framework "$framework" -output "package/$name.xcframework"
           tar -C package -czf "$TARGET_TRIPLE-$BACKEND.tar.gz" .
 
       - name: Stop sccache
